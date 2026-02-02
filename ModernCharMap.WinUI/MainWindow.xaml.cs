@@ -26,6 +26,7 @@ namespace ModernCharMap.WinUI
             InitializeComponent();
             GroupedGlyphsSource.Source = ViewModel.GlyphGroups;
             ViewModel.Initialize(DispatcherQueue);
+            ViewModel.ScrollToSelectedRequested += OnScrollToSelectedRequested;
 
             // Set title bar icon
             AppWindow.SetIcon(Path.Combine(AppContext.BaseDirectory, "Assets", "app.ico"));
@@ -79,6 +80,46 @@ namespace ModernCharMap.WinUI
             };
 
             storyboard.Begin();
+        }
+
+        private void OnScrollToSelectedRequested(object? sender, EventArgs e)
+        {
+            if (ViewModel.SelectedGlyph is not null)
+            {
+                GlyphGridView.ScrollIntoView(ViewModel.SelectedGlyph, ScrollIntoViewAlignment.Leading);
+            }
+        }
+
+        private void CodepointTextBox_KeyDown(object sender, Microsoft.UI.Xaml.Input.KeyRoutedEventArgs e)
+        {
+            if (e.Key == Windows.System.VirtualKey.Enter)
+            {
+                ViewModel.NavigateToCodepointCommand.Execute(null);
+                e.Handled = true;
+            }
+        }
+
+        private async void GlyphCard_RightTapped(object sender, Microsoft.UI.Xaml.Input.RightTappedRoutedEventArgs e)
+        {
+            if (sender is FrameworkElement element && element.DataContext is ViewModels.GlyphItem glyph)
+            {
+                ViewModel.CopyGlyph(glyph);
+
+                var flyout = new Microsoft.UI.Xaml.Controls.Flyout
+                {
+                    Content = new TextBlock
+                    {
+                        Text = "Copied!",
+                        FontSize = 14,
+                        Padding = new Thickness(4, 2, 4, 2)
+                    },
+                    Placement = Microsoft.UI.Xaml.Controls.Primitives.FlyoutPlacementMode.Top
+                };
+                flyout.ShowAt(element);
+
+                await System.Threading.Tasks.Task.Delay(800);
+                flyout.Hide();
+            }
         }
 
         private async void InstallFont_Click(object sender, RoutedEventArgs e)

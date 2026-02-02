@@ -100,32 +100,69 @@ namespace ModernCharMap.WinUI.Services
 
         public IReadOnlyList<int> GetSupportedCodePoints(string fontFamily)
         {
-            // Use GDI GetFontUnicodeRanges for speed (returns all ranges in one call).
-            var hdc = NativeMethods.GetDC(IntPtr.Zero);
-            if (hdc == IntPtr.Zero)
-                return Array.Empty<int>();
+            // Use DirectWrite IDWriteFontFace1::GetUnicodeRanges for full Unicode
+            // support including SMP (emoji, symbols above U+FFFF).
+            EnsureFontCollection();
+            int hr = _fontCollection!.FindFamilyName(fontFamily, out uint famIndex, out bool exists);
+            if (hr != 0 || !exists) return Array.Empty<int>();
+
+            hr = _fontCollection.GetFontFamily(famIndex, out var family);
+            if (hr != 0) return Array.Empty<int>();
 
             try
             {
-                var hFont = NativeMethods.CreateFontW(
-                    -16, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, fontFamily);
-                if (hFont == IntPtr.Zero)
-                    return Array.Empty<int>();
-
-                var oldFont = NativeMethods.SelectObject(hdc, hFont);
+                hr = family.GetFont(0, out var font);
+                if (hr != 0) return Array.Empty<int>();
                 try
                 {
-                    return GetUnicodeRanges(hdc);
+                    hr = font.CreateFontFace(out var fontFace);
+                    if (hr != 0) return Array.Empty<int>();
+                    try
+                    {
+                        // QI for IDWriteFontFace1 (available on Windows 8+)
+                        var fontFace1 = (IDWriteFontFace1)fontFace;
+                        return ExpandUnicodeRanges(fontFace1);
+                    }
+                    finally { Marshal.ReleaseComObject(fontFace); }
                 }
-                finally
+                finally { Marshal.ReleaseComObject(font); }
+            }
+            finally { Marshal.ReleaseComObject(family); }
+        }
+
+        private static IReadOnlyList<int> ExpandUnicodeRanges(IDWriteFontFace1 fontFace1)
+        {
+            // First call: get range count
+            fontFace1.GetUnicodeRanges(0, IntPtr.Zero, out uint rangeCount);
+            if (rangeCount == 0) return Array.Empty<int>();
+
+            // Second call: get actual ranges
+            int structSize = Marshal.SizeOf<DWriteUnicodeRange>();
+            IntPtr buffer = Marshal.AllocHGlobal(structSize * (int)rangeCount);
+            try
+            {
+                int hr = fontFace1.GetUnicodeRanges(rangeCount, buffer, out _);
+                if (hr != 0) return Array.Empty<int>();
+
+                var result = new List<int>();
+                for (int i = 0; i < (int)rangeCount; i++)
                 {
-                    NativeMethods.SelectObject(hdc, oldFont);
-                    NativeMethods.DeleteObject(hFont);
+                    var range = Marshal.PtrToStructure<DWriteUnicodeRange>(buffer + i * structSize);
+                    for (uint cp = range.First; cp <= range.Last; cp++)
+                    {
+                        if (cp < 0x0020) continue;                    // C0 controls
+                        if (cp >= 0x007F && cp <= 0x009F) continue;    // DEL + C1 controls
+                        if (cp >= 0xD800 && cp <= 0xDFFF) continue;    // surrogates
+                        if (cp >= 0xFDD0 && cp <= 0xFDEF) continue;    // noncharacters
+                        result.Add((int)cp);
+                    }
                 }
+
+                return result.AsReadOnly();
             }
             finally
             {
-                NativeMethods.ReleaseDC(IntPtr.Zero, hdc);
+                Marshal.FreeHGlobal(buffer);
             }
         }
 
@@ -424,44 +461,6 @@ namespace ModernCharMap.WinUI.Services
             Marshal.ThrowExceptionForHR(hr);
         }
 
-        private static IReadOnlyList<int> GetUnicodeRanges(IntPtr hdc)
-        {
-            uint size = NativeMethods.GetFontUnicodeRanges(hdc, IntPtr.Zero);
-            if (size == 0)
-                return Array.Empty<int>();
-
-            IntPtr buffer = Marshal.AllocHGlobal((int)size);
-            try
-            {
-                uint written = NativeMethods.GetFontUnicodeRanges(hdc, buffer);
-                if (written == 0)
-                    return Array.Empty<int>();
-
-                int cRanges = Marshal.ReadInt32(buffer, 12);
-                var result = new List<int>();
-
-                for (int i = 0; i < cRanges; i++)
-                {
-                    int offset = 16 + (i * 4);
-                    ushort wcLow = (ushort)Marshal.ReadInt16(buffer, offset);
-                    ushort cGlyphs = (ushort)Marshal.ReadInt16(buffer, offset + 2);
-
-                    for (int cp = wcLow; cp < wcLow + cGlyphs; cp++)
-                    {
-                        if (cp < 0x0020) continue;
-                        if (cp >= 0x007F && cp <= 0x009F) continue;
-                        result.Add(cp);
-                    }
-                }
-
-                return result.AsReadOnly();
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(buffer);
-            }
-        }
-
         /// <summary>
         /// Parses the OpenType 'post' table format 2.0 to extract glyph names.
         /// Returns a map of glyph index -> PostScript glyph name.
@@ -566,28 +565,6 @@ namespace ModernCharMap.WinUI.Services
 
         private static class NativeMethods
         {
-            [DllImport("user32")]
-            public static extern IntPtr GetDC(IntPtr hWnd);
-
-            [DllImport("user32")]
-            public static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
-
-            [DllImport("gdi32", CharSet = CharSet.Unicode)]
-            public static extern IntPtr CreateFontW(
-                int cHeight, int cWidth, int cEscapement, int cOrientation,
-                int cWeight, uint bItalic, uint bUnderline, uint bStrikeOut,
-                uint iCharSet, uint iOutPrecision, uint iClipPrecision,
-                uint iQuality, uint iPitchAndFamily, string pszFaceName);
-
-            [DllImport("gdi32")]
-            public static extern IntPtr SelectObject(IntPtr hdc, IntPtr h);
-
-            [DllImport("gdi32")]
-            public static extern bool DeleteObject(IntPtr ho);
-
-            [DllImport("gdi32")]
-            public static extern uint GetFontUnicodeRanges(IntPtr hdc, IntPtr lpgs);
-
             [DllImport("gdi32", CharSet = CharSet.Unicode)]
             public static extern int AddFontResourceW(string lpFileName);
 

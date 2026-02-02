@@ -48,6 +48,29 @@
                 <Button Content="Copy" Command="{x:Bind ViewModel.CopyCommand}"
                         VerticalAlignment="Center"/>
 
+                <!-- Codepoint navigation -->
+                <StackPanel Orientation="Horizontal" Spacing="6">
+                    <TextBlock Text="Go to:" VerticalAlignment="Center" FontSize="14"/>
+                    <TextBox x:Name="CodepointTextBox"
+                             Width="120"
+                             PlaceholderText="e.g. 1FA99"
+                             Text="{x:Bind ViewModel.CodepointInput, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                             FontSize="14"
+                             KeyDown="CodepointTextBox_KeyDown"/>
+                    <Button Content="Go"
+                            Command="{x:Bind ViewModel.NavigateToCodepointCommand}"
+                            VerticalAlignment="Center"/>
+                </StackPanel>
+
+                <!-- Sort mode -->
+                <StackPanel Orientation="Horizontal" Spacing="6">
+                    <TextBlock Text="Sort:" VerticalAlignment="Center" FontSize="14"/>
+                    <ComboBox Width="160"
+                              ItemsSource="{x:Bind ViewModel.SortModeOptions}"
+                              SelectedItem="{x:Bind ViewModel.SelectedSortOption, Mode=TwoWay}"
+                              FontSize="14"/>
+                </StackPanel>
+
                 <!-- Separator -->
                 <Border Width="1" Height="24" Background="{ThemeResource DividerStrokeColorDefaultBrush}"
                         VerticalAlignment="Center" Margin="4,0"/>
@@ -99,7 +122,8 @@
                                 BorderThickness="1"
                                 CornerRadius="6"
                                 Width="160" Height="160"
-                                Padding="8" Margin="2">
+                                Padding="8" Margin="2"
+                                RightTapped="GlyphCard_RightTapped">
                             <StackPanel HorizontalAlignment="Center"
                                         VerticalAlignment="Center"
                                         Spacing="2">

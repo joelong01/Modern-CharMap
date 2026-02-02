@@ -166,6 +166,47 @@ namespace ModernCharMap.WinUI.Services.DirectWrite
         void _s17(); // GetGdiCompatibleGlyphMetrics
     }
 
+    // ── IDWriteFontFace1 (extends IDWriteFontFace — adds full-Unicode range enumeration)
+    [ComImport, Guid("a71efdb4-9fdb-4838-ad90-cfc3be8c3daf")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IDWriteFontFace1
+    {
+        // --- IDWriteFontFace inherited methods (15 vtable slots) ---
+        void _ff_GetType();
+        void _ff_GetFiles();
+        void _ff_GetIndex();
+        void _ff_GetSimulations();
+        void _ff_IsSymbolFont();
+        void _ff_GetMetrics();
+        void _ff_GetGlyphCount();
+        void _ff_GetDesignGlyphMetrics();
+        void _ff_GetGlyphIndices();
+        void _ff_TryGetFontTable();
+        void _ff_ReleaseFontTable();
+        void _ff_GetGlyphRunOutline();
+        void _ff_GetRecommendedRenderingMode();
+        void _ff_GetGdiCompatibleMetrics();
+        void _ff_GetGdiCompatibleGlyphMetrics();
+
+        // --- IDWriteFontFace1 new methods ---
+        void _ff1_GetMetrics1();
+        void _ff1_GetGdiCompatibleMetrics1();
+        void _ff1_GetCaretMetrics();
+
+        [PreserveSig]
+        int GetUnicodeRanges(
+            uint maxRangeCount,
+            IntPtr unicodeRanges,
+            out uint actualRangeCount);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct DWriteUnicodeRange
+    {
+        public uint First;
+        public uint Last;
+    }
+
     // ── IDWriteLocalizedStrings ─────────────────────────────────────────────
     [ComImport, Guid("08256209-099a-4b34-b86d-c22b110e7771")]
     [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]

@@ -5,6 +5,7 @@ using ModernCharMap.WinUI.Services;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 
@@ -16,6 +17,7 @@ namespace ModernCharMap.WinUI.ViewModels
         private readonly IClipboardService _clipboardService;
         private IReadOnlyList<string> _allFontFamilies = Array.Empty<string>();
         private DispatcherQueue? _dispatcherQueue;
+        private List<GlyphItem> _loadedGlyphs = new();
 
         [ObservableProperty]
         private GlyphItem? _selectedGlyph;
@@ -25,6 +27,15 @@ namespace ModernCharMap.WinUI.ViewModels
 
         [ObservableProperty]
         private string? _statusText;
+
+        [ObservableProperty]
+        private string? _codepointInput;
+
+        [ObservableProperty]
+        private GlyphSortMode _sortMode = GlyphSortMode.ByBlock;
+
+        [ObservableProperty]
+        private SortModeOption _selectedSortOption;
 
         /// <summary>All font family names for the ComboBox.</summary>
         public ObservableCollection<string> FontFamilies { get; } = new();
@@ -38,10 +49,24 @@ namespace ModernCharMap.WinUI.ViewModels
         /// <summary>Flat glyph list (for selection binding).</summary>
         public ObservableCollection<GlyphItem> Glyphs { get; } = new();
 
+        /// <summary>Display-friendly sort mode options for the ComboBox.</summary>
+        public IReadOnlyList<SortModeOption> SortModeOptions { get; } = new[]
+        {
+            new SortModeOption(GlyphSortMode.ByBlock, "By Block"),
+            new SortModeOption(GlyphSortMode.ByCodepoint, "By Codepoint"),
+            new SortModeOption(GlyphSortMode.ByName, "By Name"),
+        };
+
+        /// <summary>
+        /// Raised when the view should scroll to make the SelectedGlyph visible.
+        /// </summary>
+        public event EventHandler? ScrollToSelectedRequested;
+
         public CharMapViewModel(IFontService fontService, IClipboardService clipboardService)
         {
             _fontService = fontService;
             _clipboardService = clipboardService;
+            _selectedSortOption = SortModeOptions[0];
 
             LoadFontFamilies();
         }
@@ -101,6 +126,47 @@ namespace ModernCharMap.WinUI.ViewModels
             StatusText = message;
         }
 
+        [RelayCommand]
+        private void NavigateToCodepoint()
+        {
+            if (string.IsNullOrWhiteSpace(CodepointInput))
+                return;
+
+            string hex = CodepointInput.Trim();
+            if (hex.StartsWith("U+", StringComparison.OrdinalIgnoreCase))
+                hex = hex[2..];
+            else if (hex.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                hex = hex[2..];
+
+            if (!int.TryParse(hex, NumberStyles.HexNumber, null, out int codePoint))
+            {
+                StatusText = $"Invalid codepoint: \"{CodepointInput}\"";
+                return;
+            }
+
+            var match = Glyphs.FirstOrDefault(g => g.CodePoint == codePoint);
+            if (match is null)
+            {
+                StatusText = $"U+{codePoint:X4} not found in {SelectedFontFamily}";
+                return;
+            }
+
+            SelectedGlyph = match;
+            StatusText = $"U+{codePoint:X4}  \u2014  {match.Label}";
+            ScrollToSelectedRequested?.Invoke(this, EventArgs.Empty);
+        }
+
+        partial void OnSelectedSortOptionChanged(SortModeOption value)
+        {
+            SortMode = value.Mode;
+        }
+
+        partial void OnSortModeChanged(GlyphSortMode value)
+        {
+            if (_loadedGlyphs.Count > 0)
+                RebuildGlyphGroups();
+        }
+
         private void LoadFontFamilies()
         {
             _allFontFamilies = _fontService.GetInstalledFontFamilies();
@@ -116,7 +182,6 @@ namespace ModernCharMap.WinUI.ViewModels
 
         /// <summary>
         /// Called by the AutoSuggestBox when the user types.
-        /// Filters the suggestion list (case-insensitive).
         /// </summary>
         public void UpdateSearchSuggestions(string text)
         {
@@ -133,12 +198,13 @@ namespace ModernCharMap.WinUI.ViewModels
 
         /// <summary>
         /// Called when the user picks a font from the search box.
-        /// Updates the ComboBox selection.
         /// </summary>
         public void SelectFontFromSearch(string fontName)
         {
             var match = _allFontFamilies.FirstOrDefault(
                 f => f.Equals(fontName, StringComparison.OrdinalIgnoreCase));
+            if (match is null && SearchSuggestions.Count > 0)
+                match = SearchSuggestions[0];
             if (match is not null)
             {
                 SelectedFontFamily = match;
@@ -154,6 +220,7 @@ namespace ModernCharMap.WinUI.ViewModels
         {
             GlyphGroups.Clear();
             Glyphs.Clear();
+            _loadedGlyphs.Clear();
             SelectedGlyph = null;
 
             if (string.IsNullOrEmpty(fontFamily))
@@ -164,7 +231,6 @@ namespace ModernCharMap.WinUI.ViewModels
 
             var codePoints = _fontService.GetSupportedCodePoints(fontFamily);
 
-            // Try to get glyph names from the font's post table
             IReadOnlyDictionary<int, string> glyphNames;
             try
             {
@@ -175,42 +241,114 @@ namespace ModernCharMap.WinUI.ViewModels
                 glyphNames = new Dictionary<int, string>();
             }
 
-            // Group glyphs by Unicode block
-            var groups = new Dictionary<string, GlyphGroup>();
-
             foreach (var cp in codePoints)
             {
                 glyphNames.TryGetValue(cp, out var name);
-                var glyph = new GlyphItem(cp, fontFamily, name);
-
-                if (!groups.TryGetValue(glyph.BlockName, out var group))
-                {
-                    group = new GlyphGroup(glyph.BlockName);
-                    groups[glyph.BlockName] = group;
-                }
-
-                group.Add(glyph);
-                Glyphs.Add(glyph);
+                _loadedGlyphs.Add(new GlyphItem(cp, fontFamily, name));
             }
 
-            // Add groups in the order they appear (by first codepoint)
-            foreach (var group in groups.Values)
+            RebuildGlyphGroups();
+        }
+
+        private void RebuildGlyphGroups()
+        {
+            var previousCodePoint = SelectedGlyph?.CodePoint;
+
+            GlyphGroups.Clear();
+            Glyphs.Clear();
+
+            IEnumerable<GlyphItem> sorted = SortMode switch
             {
-                GlyphGroups.Add(group);
+                GlyphSortMode.ByCodepoint => _loadedGlyphs.OrderBy(g => g.CodePoint),
+                GlyphSortMode.ByName => _loadedGlyphs
+                    .OrderBy(g => g.GlyphName is null ? 1 : 0)
+                    .ThenBy(g => g.GlyphName ?? string.Empty, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(g => g.CodePoint),
+                _ => _loadedGlyphs, // ByBlock: already in codepoint order
+            };
+
+            switch (SortMode)
+            {
+                case GlyphSortMode.ByBlock:
+                    {
+                        var groups = new Dictionary<string, GlyphGroup>();
+                        foreach (var glyph in sorted)
+                        {
+                            if (!groups.TryGetValue(glyph.BlockName, out var group))
+                            {
+                                group = new GlyphGroup(glyph.BlockName);
+                                groups[glyph.BlockName] = group;
+                            }
+                            group.Add(glyph);
+                            Glyphs.Add(glyph);
+                        }
+                        foreach (var group in groups.Values)
+                            GlyphGroups.Add(group);
+                        break;
+                    }
+
+                case GlyphSortMode.ByCodepoint:
+                    {
+                        var group = new GlyphGroup("All Glyphs");
+                        foreach (var glyph in sorted)
+                        {
+                            group.Add(glyph);
+                            Glyphs.Add(glyph);
+                        }
+                        GlyphGroups.Add(group);
+                        break;
+                    }
+
+                case GlyphSortMode.ByName:
+                    {
+                        var group = new GlyphGroup("All Glyphs (by name)");
+                        foreach (var glyph in sorted)
+                        {
+                            group.Add(glyph);
+                            Glyphs.Add(glyph);
+                        }
+                        GlyphGroups.Add(group);
+                        break;
+                    }
             }
 
-            int namedCount = glyphNames.Count;
+            // Restore selection
+            if (previousCodePoint.HasValue)
+                SelectedGlyph = Glyphs.FirstOrDefault(g => g.CodePoint == previousCodePoint.Value);
+
+            UpdateStatusText();
+        }
+
+        private void UpdateStatusText()
+        {
+            if (string.IsNullOrEmpty(SelectedFontFamily))
+            {
+                StatusText = null;
+                return;
+            }
+
+            string sortInfo = SortMode switch
+            {
+                GlyphSortMode.ByCodepoint => "sorted by codepoint",
+                GlyphSortMode.ByName => "sorted by name",
+                _ => $"{GlyphGroups.Count} blocks"
+            };
+
+            int namedCount = _loadedGlyphs.Count(g => g.GlyphName is not null);
             string nameInfo = namedCount > 0 ? $"  ({namedCount} named)" : "";
-            StatusText = $"{fontFamily}  \u2014  {Glyphs.Count} glyphs  \u2014  {groups.Count} blocks{nameInfo}";
+            StatusText = $"{SelectedFontFamily}  \u2014  {Glyphs.Count} glyphs  \u2014  {sortInfo}{nameInfo}";
+        }
+
+        public void CopyGlyph(GlyphItem glyph)
+        {
+            _clipboardService.SetTextWithFont(glyph.Display, glyph.FontFamily);
         }
 
         [RelayCommand]
         private void Copy()
         {
             if (SelectedGlyph is null) return;
-            _clipboardService.SetTextWithFont(
-                SelectedGlyph.Display,
-                SelectedGlyph.FontFamily);
+            CopyGlyph(SelectedGlyph);
         }
     }
 }
