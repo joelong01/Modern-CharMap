@@ -1,0 +1,42 @@
+{
+    "version": "0.2",
+    "language": "en",
+    "words": [
+        "ABORTIFHUNG",
+        "appx",
+        "camelCase",
+        "charmap",
+        "cmap",
+        "codepoint",
+        "codepoints",
+        "dwrite",
+        "FONTCHANGE",
+        "fontmap",
+        "GMEM",
+        "HKCU",
+        "HKLM",
+        "HRESULT",
+        "HWND",
+        "listheader",
+        "LOCALAPPDATA",
+        "noncharacters",
+        "OpenType",
+        "PostScript",
+        "rescan",
+        "riid",
+        "SMTO",
+        "surrogate",
+        "surrogates",
+        "TrueType",
+        "UNICODETEXT",
+        "vtable",
+        "WCRANGE"
+    ],
+    "ignorePaths": [
+        "**/bin/**",
+        "**/obj/**",
+        "**/deploy/**",
+        "**/.claude/**",
+        "**/packages/**"
+    ]
+}

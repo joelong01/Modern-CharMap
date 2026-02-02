@@ -10,8 +10,32 @@ using ModernCharMap.WinUI.Services.DirectWrite;
 
 namespace ModernCharMap.WinUI.Services
 {
+    /// <summary>
+    /// Provides font enumeration, codepoint discovery, glyph naming, and per-user
+    /// font install/uninstall capabilities using DirectWrite COM interop.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is a singleton service (<see cref="Instance"/>) that wraps a DirectWrite
+    /// factory and system font collection. It caches the font family list and
+    /// lazily initializes the collection on first use.
+    /// </para>
+    /// <para>
+    /// Font changes (install, uninstall, or external filesystem changes) are detected
+    /// via <see cref="FileSystemWatcher"/> instances on the per-user and system font
+    /// directories, with a 500ms debounce to coalesce rapid filesystem events.
+    /// </para>
+    /// <para>
+    /// All COM objects obtained from DirectWrite are explicitly released via
+    /// <see cref="Marshal.ReleaseComObject"/> in <c>finally</c> blocks to avoid leaking
+    /// native resources.
+    /// </para>
+    /// </remarks>
     public sealed class FontService : IFontService, IDisposable
     {
+        /// <summary>
+        /// The process-wide singleton instance of the font service.
+        /// </summary>
         public static IFontService Instance { get; } = new FontService();
 
         private readonly IDWriteFactory _factory;
@@ -21,23 +45,47 @@ namespace ModernCharMap.WinUI.Services
         private FileSystemWatcher? _systemWatcher;
         private Timer? _debounceTimer;
 
+        /// <inheritdoc />
         public event EventHandler? FontsChanged;
 
+        /// <summary>
+        /// Per-user font installation directory.
+        /// Fonts placed here and registered in <c>HKCU</c> are available only to the
+        /// current user and do not require administrator privileges.
+        /// </summary>
         private static readonly string PerUserFontsDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "Microsoft", "Windows", "Fonts");
 
+        /// <summary>
+        /// System-wide font directory (<c>C:\Windows\Fonts</c>).
+        /// Monitored for changes but not written to (requires admin).
+        /// </summary>
         private static readonly string SystemFontsDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Fonts");
 
+        /// <summary>
+        /// Registry key under <c>HKCU</c> (or <c>HKLM</c> for system fonts) that maps
+        /// font display names to their file paths.
+        /// </summary>
         private const string FontsRegistryKey = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts";
 
+        /// <summary>
+        /// Initializes the DirectWrite factory and starts filesystem watchers
+        /// for automatic font change detection.
+        /// </summary>
         private FontService()
         {
             _factory = DWrite.CreateFactory();
             StartFontWatchers();
         }
 
+        /// <inheritdoc />
+        /// <remarks>
+        /// Results are cached after the first call. Call <see cref="RefreshFontList"/>
+        /// to invalidate the cache after font installs or removals.
+        /// Font names are sorted alphabetically (case-insensitive) via a <see cref="SortedSet{T}"/>.
+        /// </remarks>
         public IReadOnlyList<string> GetInstalledFontFamilies()
         {
             if (_cachedFamilies is not null)
@@ -69,7 +117,7 @@ namespace ModernCharMap.WinUI.Services
                 }
                 catch
                 {
-                    // Corrupted font files can throw — ignore
+                    // Corrupted font files can throw — skip and continue
                 }
             }
 
@@ -77,6 +125,7 @@ namespace ModernCharMap.WinUI.Services
             return _cachedFamilies;
         }
 
+        /// <inheritdoc />
         public bool IsSymbolFont(string fontFamily)
         {
             EnsureFontCollection();
@@ -98,10 +147,21 @@ namespace ModernCharMap.WinUI.Services
             finally { Marshal.ReleaseComObject(family); }
         }
 
+        /// <inheritdoc />
+        /// <remarks>
+        /// <para>
+        /// Uses DirectWrite <see cref="IDWriteFontFace1.GetUnicodeRanges"/> for full
+        /// Unicode support including the Supplementary Multilingual Plane (emoji,
+        /// mathematical symbols, historic scripts above U+FFFF).
+        /// </para>
+        /// <para>
+        /// This replaces the earlier GDI-based <c>GetFontUnicodeRanges</c> approach,
+        /// which was limited to the Basic Multilingual Plane (U+0000–U+FFFF) because
+        /// GDI's <c>WCRANGE</c> structure uses 16-bit <c>WCHAR</c> values.
+        /// </para>
+        /// </remarks>
         public IReadOnlyList<int> GetSupportedCodePoints(string fontFamily)
         {
-            // Use DirectWrite IDWriteFontFace1::GetUnicodeRanges for full Unicode
-            // support including SMP (emoji, symbols above U+FFFF).
             EnsureFontCollection();
             int hr = _fontCollection!.FindFamilyName(fontFamily, out uint famIndex, out bool exists);
             if (hr != 0 || !exists) return Array.Empty<int>();
@@ -119,7 +179,7 @@ namespace ModernCharMap.WinUI.Services
                     if (hr != 0) return Array.Empty<int>();
                     try
                     {
-                        // QI for IDWriteFontFace1 (available on Windows 8+)
+                        // Cast triggers COM QueryInterface for IDWriteFontFace1 (Windows 8+)
                         var fontFace1 = (IDWriteFontFace1)fontFace;
                         return ExpandUnicodeRanges(fontFace1);
                     }
@@ -130,6 +190,23 @@ namespace ModernCharMap.WinUI.Services
             finally { Marshal.ReleaseComObject(family); }
         }
 
+        /// <summary>
+        /// Expands the Unicode ranges from a font face into individual codepoints,
+        /// filtering out control characters, surrogates, and noncharacters.
+        /// </summary>
+        /// <param name="fontFace1">The DirectWrite font face supporting range enumeration.</param>
+        /// <returns>A read-only list of valid Unicode codepoints the font supports.</returns>
+        /// <remarks>
+        /// Uses the two-call pattern: first call with count=0 to get the number of
+        /// ranges, then allocate a native buffer and call again to fill it.
+        /// Filtered codepoint ranges:
+        /// <list type="bullet">
+        ///   <item><description>U+0000–U+001F: C0 control characters</description></item>
+        ///   <item><description>U+007F–U+009F: DEL and C1 control characters</description></item>
+        ///   <item><description>U+D800–U+DFFF: UTF-16 surrogate pairs (not valid codepoints)</description></item>
+        ///   <item><description>U+FDD0–U+FDEF: Unicode noncharacters</description></item>
+        /// </list>
+        /// </remarks>
         private static IReadOnlyList<int> ExpandUnicodeRanges(IDWriteFontFace1 fontFace1)
         {
             // First call: get range count
@@ -166,11 +243,19 @@ namespace ModernCharMap.WinUI.Services
             }
         }
 
-        /// <summary>
-        /// Reads glyph names from the font's OpenType 'post' table.
-        /// Returns a dictionary mapping Unicode codepoints to glyph names.
-        /// Returns an empty dictionary if the font has no meaningful glyph names.
-        /// </summary>
+        /// <inheritdoc />
+        /// <remarks>
+        /// <para>
+        /// Reads the OpenType <c>post</c> (PostScript) table to extract glyph names,
+        /// then maps those names back to Unicode codepoints via the font's cmap.
+        /// Only <c>post</c> table format 2.0 contains per-glyph names; other formats
+        /// return an empty dictionary.
+        /// </para>
+        /// <para>
+        /// Codepoints are processed in batches of 256 for efficient glyph index lookup
+        /// via <see cref="IDWriteFontFace.GetGlyphIndices"/>.
+        /// </para>
+        /// </remarks>
         public IReadOnlyDictionary<int, string> GetGlyphNames(string fontFamily)
         {
             var result = new Dictionary<int, string>();
@@ -209,8 +294,7 @@ namespace ModernCharMap.WinUI.Services
                             if (glyphNames.Count == 0)
                                 return result;
 
-                            // Map codepoints to glyph indices, then to names.
-                            // Only process BMP characters.
+                            // Map codepoints to glyph indices, then look up names
                             var codePoints = GetSupportedCodePoints(fontFamily);
                             const int batchSize = 256;
                             for (int offset = 0; offset < codePoints.Count; offset += batchSize)
@@ -249,6 +333,16 @@ namespace ModernCharMap.WinUI.Services
             return result;
         }
 
+        /// <inheritdoc />
+        /// <remarks>
+        /// <para>Installation steps:</para>
+        /// <list type="number">
+        ///   <item><description>Copy the font file to <c>%LOCALAPPDATA%\Microsoft\Windows\Fonts\</c>.</description></item>
+        ///   <item><description>Register the font in <c>HKCU\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts</c>.</description></item>
+        ///   <item><description>Call <c>AddFontResourceW</c> to make it available in the current session.</description></item>
+        ///   <item><description>Broadcast <c>WM_FONTCHANGE</c> so other applications pick up the change.</description></item>
+        /// </list>
+        /// </remarks>
         public bool InstallFont(string fontFilePath)
         {
             try
@@ -256,15 +350,13 @@ namespace ModernCharMap.WinUI.Services
                 if (!File.Exists(fontFilePath))
                     return false;
 
-                // Ensure per-user fonts directory exists
                 Directory.CreateDirectory(PerUserFontsDir);
 
-                // Copy font file to per-user fonts directory
                 string fileName = Path.GetFileName(fontFilePath);
                 string destPath = Path.Combine(PerUserFontsDir, fileName);
                 File.Copy(fontFilePath, destPath, overwrite: true);
 
-                // Register in HKCU registry
+                // Build registry display name: "FontName (TrueType)" or "(OpenType)"
                 string fontName = Path.GetFileNameWithoutExtension(fileName);
                 string ext = Path.GetExtension(fileName).ToLowerInvariant();
                 string registryName = fontName + (ext == ".otf" ? " (OpenType)" : " (TrueType)");
@@ -275,14 +367,11 @@ namespace ModernCharMap.WinUI.Services
                     key.SetValue(registryName, destPath, RegistryValueKind.String);
                 }
 
-                // Make font available immediately
                 NativeMethods.AddFontResourceW(destPath);
                 BroadcastFontChange();
 
-                // Start watching the per-user dir if we just created it
                 EnsurePerUserWatcher();
 
-                // Notify listeners to refresh
                 FontsChanged?.Invoke(this, EventArgs.Empty);
                 return true;
             }
@@ -292,16 +381,31 @@ namespace ModernCharMap.WinUI.Services
             }
         }
 
+        /// <inheritdoc />
+        /// <remarks>
+        /// <para>
+        /// Only per-user fonts (registered under <c>HKCU</c>) can be uninstalled.
+        /// If the font is found under <c>HKLM</c> (system-wide), an error message
+        /// is returned indicating that administrator privileges are required.
+        /// </para>
+        /// <para>Uninstallation steps:</para>
+        /// <list type="number">
+        ///   <item><description>Look up the font file path in the <c>HKCU</c> fonts registry.</description></item>
+        ///   <item><description>Call <c>RemoveFontResourceW</c> to unload it from the current session.</description></item>
+        ///   <item><description>Delete the registry entry.</description></item>
+        ///   <item><description>Delete the font file (best effort — may be locked).</description></item>
+        ///   <item><description>Broadcast <c>WM_FONTCHANGE</c>.</description></item>
+        /// </list>
+        /// </remarks>
         public (bool Success, string Message) UninstallFont(string fontFamily)
         {
             try
             {
-                // Look up font in HKCU registry (per-user fonts)
                 using var key = Registry.CurrentUser.OpenSubKey(FontsRegistryKey, writable: true);
                 if (key is null)
                     return (false, "Cannot access per-user font registry.");
 
-                // Find the registry value matching this font family
+                // Search HKCU for a registry value matching this font family name
                 string? matchedValueName = null;
                 string? fontFilePath = null;
 
@@ -322,7 +426,7 @@ namespace ModernCharMap.WinUI.Services
 
                 if (matchedValueName is null || fontFilePath is null)
                 {
-                    // Check if it's a system font (HKLM)
+                    // Check if it's a system font (HKLM) — those need admin to remove
                     using var sysKey = Registry.LocalMachine.OpenSubKey(FontsRegistryKey);
                     if (sysKey is not null)
                     {
@@ -343,13 +447,9 @@ namespace ModernCharMap.WinUI.Services
                     return (false, $"Font '{fontFamily}' not found in per-user fonts.");
                 }
 
-                // Remove font resource from current session
                 NativeMethods.RemoveFontResourceW(fontFilePath);
-
-                // Delete registry entry
                 key.DeleteValue(matchedValueName);
 
-                // Delete font file
                 if (File.Exists(fontFilePath))
                 {
                     try
@@ -358,7 +458,7 @@ namespace ModernCharMap.WinUI.Services
                     }
                     catch (IOException)
                     {
-                        // File may be in use — will be cleaned up on next reboot
+                        // File may be locked by another process — will be cleaned up on reboot
                     }
                 }
 
@@ -372,9 +472,14 @@ namespace ModernCharMap.WinUI.Services
             }
         }
 
+        /// <inheritdoc />
+        /// <remarks>
+        /// Releases the current DirectWrite font collection and re-creates it with
+        /// <c>checkForUpdates = true</c>, which causes DirectWrite to rescan the
+        /// system for newly installed or removed fonts.
+        /// </remarks>
         public void RefreshFontList()
         {
-            // Release old collection
             if (_fontCollection is not null)
             {
                 try { Marshal.ReleaseComObject(_fontCollection); } catch { }
@@ -382,17 +487,23 @@ namespace ModernCharMap.WinUI.Services
             }
             _cachedFamilies = null;
 
-            // Re-create with checkForUpdates = true
             int hr = _factory.GetSystemFontCollection(out _fontCollection, true);
             if (hr != 0)
                 _fontCollection = null;
         }
 
+        /// <summary>
+        /// Starts <see cref="FileSystemWatcher"/> instances on the per-user and system
+        /// font directories to detect external font installs and removals.
+        /// </summary>
+        /// <remarks>
+        /// Watchers are best-effort: if a directory doesn't exist or access is denied,
+        /// the watcher for that directory is simply skipped.
+        /// </remarks>
         private void StartFontWatchers()
         {
             try
             {
-                // Watch per-user fonts directory
                 if (Directory.Exists(PerUserFontsDir))
                     _perUserWatcher = CreateWatcher(PerUserFontsDir);
             }
@@ -400,13 +511,18 @@ namespace ModernCharMap.WinUI.Services
 
             try
             {
-                // Watch system fonts directory
                 if (Directory.Exists(SystemFontsDir))
                     _systemWatcher = CreateWatcher(SystemFontsDir);
             }
             catch { /* best effort */ }
         }
 
+        /// <summary>
+        /// Creates a <see cref="FileSystemWatcher"/> for a font directory that triggers
+        /// <see cref="OnFontFileChanged"/> when font files are created, deleted, or renamed.
+        /// </summary>
+        /// <param name="path">The directory to monitor.</param>
+        /// <returns>A configured and active watcher.</returns>
         private FileSystemWatcher CreateWatcher(string path)
         {
             var watcher = new FileSystemWatcher(path)
@@ -424,19 +540,28 @@ namespace ModernCharMap.WinUI.Services
             return watcher;
         }
 
+        /// <summary>
+        /// Handles filesystem change events for font files with a 500ms debounce
+        /// to coalesce rapid events (e.g. multiple files installed at once).
+        /// Only responds to font file extensions: <c>.ttf</c>, <c>.otf</c>, <c>.ttc</c>, <c>.fon</c>.
+        /// </summary>
         private void OnFontFileChanged(object sender, FileSystemEventArgs e)
         {
-            // Only care about font files
             var ext = Path.GetExtension(e.FullPath).ToLowerInvariant();
             if (ext != ".ttf" && ext != ".otf" && ext != ".ttc" && ext != ".fon")
                 return;
 
-            // Debounce: wait 500ms for rapid changes to settle
+            // Debounce: reset timer on each event, fire only after 500ms of quiet
             _debounceTimer?.Dispose();
             _debounceTimer = new Timer(_ => FontsChanged?.Invoke(this, EventArgs.Empty),
                 null, 500, Timeout.Infinite);
         }
 
+        /// <summary>
+        /// Lazily creates a per-user font directory watcher if the directory exists
+        /// but no watcher has been created yet (e.g. the directory was just created
+        /// during a font install).
+        /// </summary>
         private void EnsurePerUserWatcher()
         {
             if (_perUserWatcher is null && Directory.Exists(PerUserFontsDir))
@@ -446,14 +571,24 @@ namespace ModernCharMap.WinUI.Services
             }
         }
 
+        /// <summary>
+        /// Broadcasts <c>WM_FONTCHANGE</c> (0x001D) to all top-level windows so that
+        /// other applications refresh their font lists.
+        /// Uses <c>SMTO_ABORTIFHUNG</c> with a 1-second timeout to avoid blocking
+        /// if a window is unresponsive.
+        /// </summary>
         private static void BroadcastFontChange()
         {
-            // WM_FONTCHANGE = 0x001D, HWND_BROADCAST = 0xFFFF
+            // HWND_BROADCAST = 0xFFFF, WM_FONTCHANGE = 0x001D
             NativeMethods.SendMessageTimeoutW(
                 (IntPtr)0xFFFF, 0x001D, IntPtr.Zero, IntPtr.Zero,
                 0x0002 /* SMTO_ABORTIFHUNG */, 1000, out _);
         }
 
+        /// <summary>
+        /// Lazily initializes the DirectWrite system font collection on first use.
+        /// </summary>
+        /// <exception cref="COMException">Thrown if DirectWrite fails to enumerate fonts.</exception>
         private void EnsureFontCollection()
         {
             if (_fontCollection is not null) return;
@@ -462,9 +597,28 @@ namespace ModernCharMap.WinUI.Services
         }
 
         /// <summary>
-        /// Parses the OpenType 'post' table format 2.0 to extract glyph names.
-        /// Returns a map of glyph index -> PostScript glyph name.
+        /// Parses the OpenType <c>post</c> (PostScript naming) table, format 2.0,
+        /// to extract per-glyph PostScript names.
         /// </summary>
+        /// <param name="data">Pointer to the raw <c>post</c> table data.</param>
+        /// <param name="size">Size of the table in bytes.</param>
+        /// <returns>
+        /// A dictionary mapping glyph indices to their PostScript names.
+        /// Returns empty if the table is not format 2.0 or is malformed.
+        /// </returns>
+        /// <remarks>
+        /// <para>
+        /// The <c>post</c> table format 2.0 layout:
+        /// <list type="bullet">
+        ///   <item><description>Bytes 0–3: Version (0x00020000 for format 2.0)</description></item>
+        ///   <item><description>Bytes 32–33: Number of glyphs</description></item>
+        ///   <item><description>Bytes 34+: Array of glyph name indices (2 bytes each)</description></item>
+        ///   <item><description>Following the array: Pascal strings (length byte + ASCII chars)</description></item>
+        /// </list>
+        /// Glyph name indices 0–257 refer to the standard Macintosh glyph name set;
+        /// indices 258+ refer to the custom names in the Pascal string list.
+        /// </para>
+        /// </remarks>
         private static Dictionary<ushort, string> ParsePostTable(IntPtr data, uint size)
         {
             var result = new Dictionary<ushort, string>();
@@ -478,7 +632,7 @@ namespace ModernCharMap.WinUI.Services
             if (size < indexArrayEnd)
                 return result;
 
-            // Read glyph name index array
+            // Read the glyph name index array
             var glyphNameIndices = new ushort[numberOfGlyphs];
             for (int i = 0; i < numberOfGlyphs; i++)
                 glyphNameIndices[i] = DWriteHelper.ReadUInt16BE(data, 34 + i * 2);
@@ -510,7 +664,7 @@ namespace ModernCharMap.WinUI.Services
                     if (customIndex < customNames.Count)
                     {
                         string name = customNames[customIndex];
-                        // Skip generic names like .notdef, .null
+                        // Skip generic/placeholder names
                         if (!string.IsNullOrEmpty(name) &&
                             !name.StartsWith('.') &&
                             !name.Equals("space", StringComparison.OrdinalIgnoreCase))
@@ -525,19 +679,24 @@ namespace ModernCharMap.WinUI.Services
         }
 
         /// <summary>
-        /// Converts PostScript glyph names to display-friendly format.
-        /// e.g. "building-city" -> "Building City", "uniE900" -> kept as-is
+        /// Converts a PostScript glyph name into a human-readable display name.
         /// </summary>
+        /// <param name="postScriptName">The raw PostScript glyph name (e.g. "building-city").</param>
+        /// <returns>
+        /// A title-cased, space-separated display name (e.g. "Building City").
+        /// Names starting with "uni" followed by hex digits (codepoint references)
+        /// are returned as-is.
+        /// </returns>
         private static string FormatGlyphName(string postScriptName)
         {
-            // Skip "uniXXXX" names — they're just codepoint references
+            // Skip "uniXXXX" names — they're just codepoint references, not real names
             if (postScriptName.StartsWith("uni", StringComparison.OrdinalIgnoreCase) &&
                 postScriptName.Length >= 7)
             {
-                return postScriptName; // Keep as-is; caller can filter
+                return postScriptName;
             }
 
-            // Replace hyphens, underscores, camelCase with spaces
+            // Replace hyphens, underscores, and camelCase boundaries with spaces
             var sb = new StringBuilder(postScriptName.Length + 4);
             for (int i = 0; i < postScriptName.Length; i++)
             {
@@ -557,26 +716,38 @@ namespace ModernCharMap.WinUI.Services
                 }
             }
 
-            // Title case each word
+            // Title-case each word
             var words = sb.ToString().Split(' ', StringSplitOptions.RemoveEmptyEntries);
             return string.Join(' ', words.Select(w =>
                 char.ToUpper(w[0]) + (w.Length > 1 ? w[1..] : "")));
         }
 
+        /// <summary>
+        /// Win32 P/Invoke declarations for font installation and broadcasting.
+        /// </summary>
         private static class NativeMethods
         {
+            /// <summary>Registers a font file so it is available in the current session.</summary>
             [DllImport("gdi32", CharSet = CharSet.Unicode)]
             public static extern int AddFontResourceW(string lpFileName);
 
+            /// <summary>Removes a previously registered font file from the current session.</summary>
             [DllImport("gdi32", CharSet = CharSet.Unicode)]
             public static extern int RemoveFontResourceW(string lpFileName);
 
+            /// <summary>
+            /// Sends a message to a window with a timeout, used to broadcast
+            /// <c>WM_FONTCHANGE</c> to all top-level windows.
+            /// </summary>
             [DllImport("user32", CharSet = CharSet.Unicode)]
             public static extern IntPtr SendMessageTimeoutW(
                 IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam,
                 uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
         }
 
+        /// <summary>
+        /// Releases filesystem watchers and the debounce timer.
+        /// </summary>
         public void Dispose()
         {
             _debounceTimer?.Dispose();
