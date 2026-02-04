@@ -33,14 +33,20 @@ namespace ModernCharMap.WinUI.Services.DirectWrite
             [MarshalAs(UnmanagedType.IUnknown)] out object factory);
 
         /// <summary>
-        /// Creates a shared <see cref="IDWriteFactory"/> instance.
+        /// Creates an <see cref="IDWriteFactory"/> instance.
         /// </summary>
-        /// <returns>A shared DirectWrite factory for font enumeration and rendering.</returns>
+        /// <param name="isolated">
+        /// When <c>false</c> (default), creates a shared factory (process-global singleton).
+        /// When <c>true</c>, creates an isolated factory with independent caches that
+        /// always reads fresh data from disk — use this for refresh after font file changes.
+        /// </param>
+        /// <returns>A DirectWrite factory for font enumeration and rendering.</returns>
         /// <exception cref="COMException">Thrown if the native call fails.</exception>
-        public static IDWriteFactory CreateFactory()
+        public static IDWriteFactory CreateFactory(bool isolated = false)
         {
             var iid = typeof(IDWriteFactory).GUID;
-            int hr = DWriteCreateFactory(0 /* DWRITE_FACTORY_TYPE_SHARED */, iid, out object obj);
+            int factoryType = isolated ? 1 /* DWRITE_FACTORY_TYPE_ISOLATED */ : 0 /* DWRITE_FACTORY_TYPE_SHARED */;
+            int hr = DWriteCreateFactory(factoryType, iid, out object obj);
             Marshal.ThrowExceptionForHR(hr);
             return (IDWriteFactory)obj;
         }

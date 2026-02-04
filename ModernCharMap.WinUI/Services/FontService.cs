@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -38,7 +39,7 @@ namespace ModernCharMap.WinUI.Services
         /// </summary>
         public static IFontService Instance { get; } = new FontService();
 
-        private readonly IDWriteFactory _factory;
+        private IDWriteFactory _factory;
         private IDWriteFontCollection? _fontCollection;
         private IReadOnlyList<string>? _cachedFamilies;
         private FileSystemWatcher? _perUserWatcher;
@@ -354,6 +355,15 @@ namespace ModernCharMap.WinUI.Services
 
                 string fileName = Path.GetFileName(fontFilePath);
                 string destPath = Path.Combine(PerUserFontsDir, fileName);
+
+                // If overwriting an existing font file, unload the old version from
+                // GDI's cache first. Without this, GDI keeps the old file memory-mapped
+                // and the new glyphs won't appear until the next login.
+                if (File.Exists(destPath))
+                {
+                    NativeMethods.RemoveFontResourceW(destPath);
+                }
+
                 File.Copy(fontFilePath, destPath, overwrite: true);
 
                 // Build registry display name: "FontName (TrueType)" or "(OpenType)"
@@ -405,7 +415,14 @@ namespace ModernCharMap.WinUI.Services
                 if (key is null)
                     return (false, "Cannot access per-user font registry.");
 
-                // Search HKCU for a registry value matching this font family name
+                // Search HKCU for a registry value matching this font family name.
+                // The registry value name is the file's display name (e.g. "MyFont (TrueType)")
+                // which may differ from the font's internal family name reported by DirectWrite.
+                // We try three strategies:
+                //   1. Exact match on the base name (value name minus "(TrueType)"/"(OpenType)")
+                //   2. Prefix match (value name starts with the font family)
+                //   3. Scan all per-user font file paths and use DirectWrite to resolve
+                //      which file provides this family name
                 string? matchedValueName = null;
                 string? fontFilePath = null;
 
@@ -424,27 +441,33 @@ namespace ModernCharMap.WinUI.Services
                     }
                 }
 
-                if (matchedValueName is null || fontFilePath is null)
+                // Strategy 3: if no name match, check which per-user font file
+                // provides this family by looking at file paths in the per-user dir
+                if (matchedValueName is null)
                 {
-                    // Check if it's a system font (HKLM) — those need admin to remove
-                    using var sysKey = Registry.LocalMachine.OpenSubKey(FontsRegistryKey);
-                    if (sysKey is not null)
+                    foreach (string valueName in key.GetValueNames())
                     {
-                        foreach (string valueName in sysKey.GetValueNames())
-                        {
-                            string baseName = valueName
-                                .Replace(" (TrueType)", "")
-                                .Replace(" (OpenType)", "");
+                        string? path = key.GetValue(valueName) as string;
+                        if (path is null) continue;
 
-                            if (baseName.Equals(fontFamily, StringComparison.OrdinalIgnoreCase) ||
-                                valueName.StartsWith(fontFamily, StringComparison.OrdinalIgnoreCase))
-                            {
-                                return (false, $"'{fontFamily}' is a system font. Removing it requires administrator privileges.");
-                            }
+                        // Only consider files in the per-user fonts directory
+                        if (!path.StartsWith(PerUserFontsDir, StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        // Check if this file provides the requested font family
+                        if (FontFileProvidesFamilyName(path, fontFamily))
+                        {
+                            matchedValueName = valueName;
+                            fontFilePath = path;
+                            break;
                         }
                     }
+                }
 
-                    return (false, $"Font '{fontFamily}' not found in per-user fonts.");
+                if (matchedValueName is null || fontFilePath is null)
+                {
+                    // Not found in HKCU — check HKLM for system fonts
+                    return TryUninstallSystemFont(fontFamily);
                 }
 
                 NativeMethods.RemoveFontResourceW(fontFilePath);
@@ -474,17 +497,35 @@ namespace ModernCharMap.WinUI.Services
 
         /// <inheritdoc />
         /// <remarks>
-        /// Releases the current DirectWrite font collection and re-creates it with
-        /// <c>checkForUpdates = true</c>, which causes DirectWrite to rescan the
-        /// system for newly installed or removed fonts.
+        /// <para>
+        /// Destroys the current DirectWrite factory and font collection entirely,
+        /// then creates a fresh isolated factory. This is necessary because the
+        /// shared factory (<c>DWRITE_FACTORY_TYPE_SHARED</c>) is a process-global
+        /// singleton that caches font face data aggressively — even with
+        /// <c>checkForUpdates = true</c>, it may serve stale glyph data for a
+        /// font file that was overwritten in place.
+        /// </para>
+        /// <para>
+        /// An isolated factory (<c>DWRITE_FACTORY_TYPE_ISOLATED</c>) has its own
+        /// independent caches and always reads fresh data from disk.
+        /// </para>
         /// </remarks>
         public void RefreshFontList()
         {
+            // Release the old collection
             if (_fontCollection is not null)
             {
                 try { Marshal.ReleaseComObject(_fontCollection); } catch { }
                 _fontCollection = null;
             }
+
+            // Release the old factory — a SHARED factory is a process singleton
+            // that caches font face data, so getting a new collection from it
+            // won't pick up file content changes.
+            try { Marshal.ReleaseComObject(_factory); } catch { }
+
+            // Create a fresh ISOLATED factory with its own caches
+            _factory = DWrite.CreateFactory(isolated: true);
             _cachedFamilies = null;
 
             int hr = _factory.GetSystemFontCollection(out _fontCollection, true);
@@ -721,6 +762,273 @@ namespace ModernCharMap.WinUI.Services
             return string.Join(' ', words.Select(w =>
                 char.ToUpper(w[0]) + (w.Length > 1 ? w[1..] : "")));
         }
+
+        /// <summary>
+        /// Searches HKLM for a system font matching <paramref name="fontFamily"/> and
+        /// attempts to uninstall it. Uses three matching strategies (exact name, prefix,
+        /// and OpenType name table inspection), then either uninstalls directly if the
+        /// process has admin rights or launches an elevated PowerShell process.
+        /// </summary>
+        /// <param name="fontFamily">The DirectWrite font family name to uninstall.</param>
+        /// <returns>A tuple indicating success and a user-facing message.</returns>
+        private (bool Success, string Message) TryUninstallSystemFont(string fontFamily)
+        {
+            using var sysKey = Registry.LocalMachine.OpenSubKey(FontsRegistryKey);
+            if (sysKey is null)
+                return (false, $"Font '{fontFamily}' not found in installed fonts.");
+
+            string? sysValueName = null;
+            string? sysFilePath = null;
+
+            // Strategy 1 & 2: Exact base-name match or prefix match
+            foreach (string valueName in sysKey.GetValueNames())
+            {
+                string baseName = valueName
+                    .Replace(" (TrueType)", "")
+                    .Replace(" (OpenType)", "");
+
+                if (baseName.Equals(fontFamily, StringComparison.OrdinalIgnoreCase) ||
+                    valueName.StartsWith(fontFamily, StringComparison.OrdinalIgnoreCase))
+                {
+                    sysValueName = valueName;
+                    string? raw = sysKey.GetValue(valueName) as string;
+                    if (raw is not null && !Path.IsPathRooted(raw))
+                        raw = Path.Combine(SystemFontsDir, raw);
+                    sysFilePath = raw;
+                    break;
+                }
+            }
+
+            // Strategy 3: Read the OpenType name table from each system font file
+            if (sysValueName is null)
+            {
+                foreach (string valueName in sysKey.GetValueNames())
+                {
+                    string? raw = sysKey.GetValue(valueName) as string;
+                    if (raw is null) continue;
+
+                    string path = Path.IsPathRooted(raw) ? raw : Path.Combine(SystemFontsDir, raw);
+                    if (FontFileProvidesFamilyName(path, fontFamily))
+                    {
+                        sysValueName = valueName;
+                        sysFilePath = path;
+                        break;
+                    }
+                }
+            }
+
+            if (sysValueName is null || sysFilePath is null)
+                return (false, $"Font '{fontFamily}' not found in installed fonts.");
+
+            // Unload from GDI session cache before removing
+            NativeMethods.RemoveFontResourceW(sysFilePath);
+
+            // Try direct uninstall (succeeds if process is running as admin).
+            // OpenSubKey with writable:true throws SecurityException on most systems
+            // when not elevated, rather than returning null.
+            bool directSuccess = false;
+            try
+            {
+                using var sysKeyWritable = Registry.LocalMachine.OpenSubKey(FontsRegistryKey, writable: true);
+                if (sysKeyWritable is not null)
+                {
+                    sysKeyWritable.DeleteValue(sysValueName, throwOnMissingValue: false);
+                    if (File.Exists(sysFilePath))
+                    {
+                        try { File.Delete(sysFilePath); }
+                        catch (IOException) { /* file locked — cleaned up on reboot */ }
+                    }
+                    directSuccess = true;
+                }
+            }
+            catch (System.Security.SecurityException) { /* expected when not admin */ }
+            catch (UnauthorizedAccessException) { /* expected when not admin */ }
+
+            if (directSuccess)
+            {
+                BroadcastFontChange();
+                FontsChanged?.Invoke(this, EventArgs.Empty);
+                return (true, $"System font '{fontFamily}' has been uninstalled.");
+            }
+
+            // Not admin — launch elevated PowerShell to remove registry entry and file
+            if (UninstallSystemFontElevated(sysValueName, sysFilePath))
+            {
+                BroadcastFontChange();
+                FontsChanged?.Invoke(this, EventArgs.Empty);
+                return (true, $"System font '{fontFamily}' has been uninstalled.");
+            }
+
+            // Elevation failed or was cancelled — re-add the font resource
+            NativeMethods.AddFontResourceW(sysFilePath);
+            return (false, $"Failed to uninstall system font '{fontFamily}'. The operation was cancelled or requires administrator privileges.");
+        }
+
+        /// <summary>
+        /// Launches an elevated PowerShell process to delete a system font's registry
+        /// entry from HKLM and remove the font file from <c>C:\Windows\Fonts</c>.
+        /// Shows a UAC consent dialog to the user.
+        /// </summary>
+        /// <param name="registryValueName">The HKLM registry value name (e.g. "Arial (TrueType)").</param>
+        /// <param name="fontFilePath">The full path to the font file.</param>
+        /// <returns><c>true</c> if the elevated process completed successfully.</returns>
+        private static bool UninstallSystemFontElevated(string registryValueName, string fontFilePath)
+        {
+            try
+            {
+                string escapedName = registryValueName.Replace("'", "''");
+                string escapedPath = fontFilePath.Replace("'", "''");
+
+                string script =
+                    $"Remove-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts' " +
+                    $"-Name '{escapedName}' -Force -ErrorAction Stop; " +
+                    $"if (Test-Path '{escapedPath}') {{ Remove-Item -Path '{escapedPath}' -Force -ErrorAction SilentlyContinue }}";
+
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "powershell.exe",
+                    Arguments = $"-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command \"{script}\"",
+                    Verb = "runas",
+                    UseShellExecute = true,
+                };
+
+                using var proc = Process.Start(psi);
+                if (proc is null) return false;
+                proc.WaitForExit(15000);
+                return proc.ExitCode == 0;
+            }
+            catch (System.ComponentModel.Win32Exception)
+            {
+                // User declined the UAC prompt
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Checks whether a font file on disk provides the specified font family name
+        /// by reading the OpenType <c>name</c> table directly from the file.
+        /// Handles both single fonts (TTF/OTF) and TrueType Collections (TTC).
+        /// </summary>
+        /// <param name="filePath">Full path to the font file.</param>
+        /// <param name="familyName">The DirectWrite family name to look for.</param>
+        /// <returns><c>true</c> if the file contains a font with the given family name.</returns>
+        private static bool FontFileProvidesFamilyName(string filePath, string familyName)
+        {
+            try
+            {
+                if (!File.Exists(filePath)) return false;
+
+                byte[] data = File.ReadAllBytes(filePath);
+                if (data.Length < 12) return false;
+
+                uint tag = FontReadBE32(data, 0);
+
+                if (tag == 0x74746366) // 'ttcf' — TrueType Collection
+                {
+                    if (data.Length < 16) return false;
+                    uint numFonts = FontReadBE32(data, 8);
+                    for (uint i = 0; i < numFonts && i < 64; i++)
+                    {
+                        if (data.Length < 12 + (i + 1) * 4) break;
+                        uint fontOffset = FontReadBE32(data, (int)(12 + i * 4));
+                        if (CheckFontNameTable(data, fontOffset, familyName))
+                            return true;
+                    }
+                    return false;
+                }
+
+                // Single font (TTF or OTF)
+                return CheckFontNameTable(data, 0, familyName);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Parses the OpenType <c>name</c> table at the given offset within a font file
+        /// to check whether it contains the specified family name (Name ID 1).
+        /// </summary>
+        /// <param name="data">The raw font file bytes.</param>
+        /// <param name="fontOffset">
+        /// Byte offset to the start of this font's offset table (0 for single fonts,
+        /// or the TTC directory entry offset for collection fonts).
+        /// </param>
+        /// <param name="familyName">The family name to match (case-insensitive).</param>
+        /// <returns><c>true</c> if the name table contains a matching family name.</returns>
+        private static bool CheckFontNameTable(byte[] data, uint fontOffset, string familyName)
+        {
+            if (data.Length < fontOffset + 12) return false;
+
+            ushort numTables = FontReadBE16(data, (int)(fontOffset + 4));
+
+            // Locate the 'name' table in the table directory
+            uint nameTableOffset = 0;
+            for (int i = 0; i < numTables; i++)
+            {
+                int entryOffset = (int)(fontOffset + 12 + i * 16);
+                if (entryOffset + 16 > data.Length) break;
+
+                uint tableTag = FontReadBE32(data, entryOffset);
+                if (tableTag == 0x6E616D65) // 'name'
+                {
+                    nameTableOffset = FontReadBE32(data, entryOffset + 8);
+                    break;
+                }
+            }
+
+            if (nameTableOffset == 0 || data.Length < nameTableOffset + 6)
+                return false;
+
+            // Parse name table header
+            ushort count = FontReadBE16(data, (int)(nameTableOffset + 2));
+            ushort stringStorageOffset = FontReadBE16(data, (int)(nameTableOffset + 4));
+
+            for (int i = 0; i < count; i++)
+            {
+                int recordOffset = (int)(nameTableOffset + 6 + i * 12);
+                if (recordOffset + 12 > data.Length) break;
+
+                ushort platformId = FontReadBE16(data, recordOffset);
+                ushort encodingId = FontReadBE16(data, recordOffset + 2);
+                ushort nameId = FontReadBE16(data, recordOffset + 6);
+                ushort length = FontReadBE16(data, recordOffset + 8);
+                ushort offset = FontReadBE16(data, recordOffset + 10);
+
+                // Name ID 1 = Font Family; Platform 3 = Windows, Encoding 1 = Unicode BMP
+                if (nameId == 1 && platformId == 3 && encodingId == 1)
+                {
+                    uint strPos = nameTableOffset + (uint)stringStorageOffset + offset;
+                    if (strPos + length > data.Length) continue;
+
+                    string name = Encoding.BigEndianUnicode.GetString(data, (int)strPos, length);
+                    if (name.Equals(familyName, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Reads a 32-bit big-endian unsigned integer from a byte array.
+        /// Used for parsing OpenType font file headers and table directories.
+        /// </summary>
+        private static uint FontReadBE32(byte[] data, int offset) =>
+            (uint)((data[offset] << 24) | (data[offset + 1] << 16) |
+                   (data[offset + 2] << 8) | data[offset + 3]);
+
+        /// <summary>
+        /// Reads a 16-bit big-endian unsigned integer from a byte array.
+        /// Used for parsing OpenType font file name table records.
+        /// </summary>
+        private static ushort FontReadBE16(byte[] data, int offset) =>
+            (ushort)((data[offset] << 8) | data[offset + 1]);
 
         /// <summary>
         /// Win32 P/Invoke declarations for font installation and broadcasting.

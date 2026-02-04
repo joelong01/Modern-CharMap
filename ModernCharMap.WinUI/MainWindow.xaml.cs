@@ -1,4 +1,5 @@
 using System;
+using System.ComponentModel;
 using System.IO;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -46,6 +47,8 @@ namespace ModernCharMap.WinUI
             GroupedGlyphsSource.Source = ViewModel.GlyphGroups;
             ViewModel.Initialize(DispatcherQueue);
             ViewModel.ScrollToSelectedRequested += OnScrollToSelectedRequested;
+            ViewModel.PropertyChanged += OnViewModelPropertyChanged;
+            SortByBlockMenuItem.IsChecked = true;
 
             AppWindow.SetIcon(Path.Combine(AppContext.BaseDirectory, "Assets", "app.ico"));
 
@@ -225,5 +228,50 @@ namespace ModernCharMap.WinUI
                 ViewModel.SelectFontFromSearch(args.QueryText);
             }
         }
+
+        /// <summary>
+        /// Keeps the View menu's sort radio items in sync when the sort mode changes
+        /// via the CommandBar's Sort ComboBox.
+        /// </summary>
+        private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
+        {
+            if (e.PropertyName == nameof(CharMapViewModel.SortMode))
+            {
+                SortByBlockMenuItem.IsChecked = ViewModel.SortMode == GlyphSortMode.ByBlock;
+                SortByCodepointMenuItem.IsChecked = ViewModel.SortMode == GlyphSortMode.ByCodepoint;
+                SortByNameMenuItem.IsChecked = ViewModel.SortMode == GlyphSortMode.ByName;
+            }
+        }
+
+        /// <summary>
+        /// Sets the sort mode to "By Block" from the View menu.
+        /// </summary>
+        private void SortByBlock_Click(object sender, RoutedEventArgs e)
+            => ViewModel.SetSortMode(GlyphSortMode.ByBlock);
+
+        /// <summary>
+        /// Sets the sort mode to "By Codepoint" from the View menu.
+        /// </summary>
+        private void SortByCodepoint_Click(object sender, RoutedEventArgs e)
+            => ViewModel.SetSortMode(GlyphSortMode.ByCodepoint);
+
+        /// <summary>
+        /// Sets the sort mode to "By Name" from the View menu.
+        /// </summary>
+        private void SortByName_Click(object sender, RoutedEventArgs e)
+            => ViewModel.SetSortMode(GlyphSortMode.ByName);
+
+        /// <summary>
+        /// Moves keyboard focus to the codepoint navigation TextBox.
+        /// Invoked from the Edit menu's "Go to Codepoint..." item (Ctrl+G).
+        /// </summary>
+        private void GoToCodepoint_Click(object sender, RoutedEventArgs e)
+            => CodepointTextBox.Focus(FocusState.Keyboard);
+
+        /// <summary>
+        /// Closes the application window. Invoked from the File menu's "Exit" item.
+        /// </summary>
+        private void ExitApp_Click(object sender, RoutedEventArgs e)
+            => Close();
     }
 }

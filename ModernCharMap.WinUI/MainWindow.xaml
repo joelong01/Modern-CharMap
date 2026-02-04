@@ -13,88 +13,137 @@
         <Grid x:Name="MainContent" Opacity="0">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
                 <RowDefinition Height="*"/>
                 <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
 
-            <!-- Toolbar -->
-            <StackPanel Orientation="Horizontal" Spacing="12" Padding="12,8"
-                        Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+            <!-- Menu bar -->
+            <MenuBar Grid.Row="0">
+                <MenuBarItem Title="File">
+                    <MenuFlyoutItem Text="Install Font..." Click="InstallFont_Click">
+                        <MenuFlyoutItem.KeyboardAccelerators>
+                            <KeyboardAccelerator Modifiers="Control" Key="I"/>
+                        </MenuFlyoutItem.KeyboardAccelerators>
+                    </MenuFlyoutItem>
+                    <MenuFlyoutItem Text="Uninstall Font"
+                                    Command="{x:Bind ViewModel.UninstallSelectedFontCommand}">
+                        <MenuFlyoutItem.KeyboardAccelerators>
+                            <KeyboardAccelerator Modifiers="Control,Shift" Key="U"/>
+                        </MenuFlyoutItem.KeyboardAccelerators>
+                    </MenuFlyoutItem>
+                    <MenuFlyoutSeparator/>
+                    <MenuFlyoutItem Text="Refresh Font"
+                                    Command="{x:Bind ViewModel.RefreshCurrentFontCommand}">
+                        <MenuFlyoutItem.KeyboardAccelerators>
+                            <KeyboardAccelerator Key="F5"/>
+                        </MenuFlyoutItem.KeyboardAccelerators>
+                    </MenuFlyoutItem>
+                    <MenuFlyoutSeparator/>
+                    <MenuFlyoutItem Text="Exit" Click="ExitApp_Click">
+                        <MenuFlyoutItem.KeyboardAccelerators>
+                            <KeyboardAccelerator Modifiers="Menu" Key="F4"/>
+                        </MenuFlyoutItem.KeyboardAccelerators>
+                    </MenuFlyoutItem>
+                </MenuBarItem>
 
-                <!-- Font selection dropdown -->
-                <StackPanel Orientation="Horizontal" Spacing="6">
-                    <TextBlock Text="Font:" VerticalAlignment="Center" FontSize="14"/>
-                    <ComboBox x:Name="FontComboBox"
-                              Width="300"
-                              ItemsSource="{x:Bind ViewModel.FontFamilies}"
-                              SelectedItem="{x:Bind ViewModel.SelectedFontFamily, Mode=TwoWay}"
-                              FontSize="14"/>
-                </StackPanel>
+                <MenuBarItem Title="Edit">
+                    <MenuFlyoutItem Text="Copy Glyph"
+                                    Command="{x:Bind ViewModel.CopyCommand}">
+                        <MenuFlyoutItem.KeyboardAccelerators>
+                            <KeyboardAccelerator Modifiers="Control,Shift" Key="C"/>
+                        </MenuFlyoutItem.KeyboardAccelerators>
+                    </MenuFlyoutItem>
+                    <MenuFlyoutSeparator/>
+                    <MenuFlyoutItem Text="Go to Codepoint..." Click="GoToCodepoint_Click">
+                        <MenuFlyoutItem.KeyboardAccelerators>
+                            <KeyboardAccelerator Modifiers="Control" Key="G"/>
+                        </MenuFlyoutItem.KeyboardAccelerators>
+                    </MenuFlyoutItem>
+                </MenuBarItem>
 
-                <!-- Font search -->
-                <StackPanel Orientation="Horizontal" Spacing="6">
-                    <TextBlock Text="Search:" VerticalAlignment="Center" FontSize="14"/>
-                    <AutoSuggestBox x:Name="FontSearch"
-                                    Width="280"
-                                    PlaceholderText="Type to find a font..."
-                                    ItemsSource="{x:Bind ViewModel.SearchSuggestions}"
-                                    TextChanged="FontSearch_TextChanged"
-                                    SuggestionChosen="FontSearch_SuggestionChosen"
-                                    QuerySubmitted="FontSearch_QuerySubmitted"
-                                    QueryIcon="Find"/>
-                </StackPanel>
+                <MenuBarItem Title="View">
+                    <RadioMenuFlyoutItem x:Name="SortByBlockMenuItem" Text="Sort by Block"
+                                         GroupName="SortMode" Click="SortByBlock_Click"/>
+                    <RadioMenuFlyoutItem x:Name="SortByCodepointMenuItem" Text="Sort by Codepoint"
+                                         GroupName="SortMode" Click="SortByCodepoint_Click"/>
+                    <RadioMenuFlyoutItem x:Name="SortByNameMenuItem" Text="Sort by Name"
+                                         GroupName="SortMode" Click="SortByName_Click"/>
+                </MenuBarItem>
+            </MenuBar>
 
-                <!-- Copy button -->
-                <Button Content="Copy" Command="{x:Bind ViewModel.CopyCommand}"
-                        VerticalAlignment="Center"/>
-
-                <!-- Codepoint navigation -->
-                <StackPanel Orientation="Horizontal" Spacing="6">
-                    <TextBlock Text="Go to:" VerticalAlignment="Center" FontSize="14"/>
-                    <TextBox x:Name="CodepointTextBox"
-                             Width="120"
-                             PlaceholderText="e.g. 1FA99"
-                             Text="{x:Bind ViewModel.CodepointInput, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                             FontSize="14"
-                             KeyDown="CodepointTextBox_KeyDown"/>
-                    <Button Content="Go"
-                            Command="{x:Bind ViewModel.NavigateToCodepointCommand}"
-                            VerticalAlignment="Center"/>
-                </StackPanel>
-
-                <!-- Sort mode -->
-                <StackPanel Orientation="Horizontal" Spacing="6">
-                    <TextBlock Text="Sort:" VerticalAlignment="Center" FontSize="14"/>
-                    <ComboBox Width="160"
-                              ItemsSource="{x:Bind ViewModel.SortModeOptions}"
-                              SelectedItem="{x:Bind ViewModel.SelectedSortOption, Mode=TwoWay}"
-                              FontSize="14"/>
-                </StackPanel>
-
-                <!-- Separator -->
-                <Border Width="1" Height="24" Background="{ThemeResource DividerStrokeColorDefaultBrush}"
-                        VerticalAlignment="Center" Margin="4,0"/>
-
-                <!-- Font management -->
-                <Button Click="InstallFont_Click" VerticalAlignment="Center"
-                        ToolTipService.ToolTip="Install a .ttf or .otf font file (per-user, no admin)">
-                    <StackPanel Orientation="Horizontal" Spacing="6">
-                        <SymbolIcon Symbol="Add"/>
-                        <TextBlock Text="Install Font"/>
+            <!-- Command bar -->
+            <CommandBar Grid.Row="1" DefaultLabelPosition="Right">
+                <CommandBar.Content>
+                    <StackPanel Orientation="Horizontal" Spacing="8"
+                                VerticalAlignment="Center" Padding="8,0">
+                        <TextBlock Text="Font:" VerticalAlignment="Center" FontSize="14"/>
+                        <ComboBox x:Name="FontComboBox"
+                                  Width="300"
+                                  ItemsSource="{x:Bind ViewModel.FontFamilies}"
+                                  SelectedItem="{x:Bind ViewModel.SelectedFontFamily, Mode=TwoWay}"
+                                  FontSize="14"/>
+                        <AutoSuggestBox x:Name="FontSearch"
+                                        Width="280"
+                                        PlaceholderText="Type to find a font..."
+                                        ItemsSource="{x:Bind ViewModel.SearchSuggestions}"
+                                        TextChanged="FontSearch_TextChanged"
+                                        SuggestionChosen="FontSearch_SuggestionChosen"
+                                        QuerySubmitted="FontSearch_QuerySubmitted"
+                                        QueryIcon="Find"/>
                     </StackPanel>
-                </Button>
-                <Button Command="{x:Bind ViewModel.UninstallSelectedFontCommand}"
-                        VerticalAlignment="Center"
-                        ToolTipService.ToolTip="Uninstall the selected per-user font">
-                    <StackPanel Orientation="Horizontal" Spacing="6">
-                        <SymbolIcon Symbol="Delete"/>
-                        <TextBlock Text="Uninstall"/>
+                </CommandBar.Content>
+
+                <AppBarButton Icon="Copy" Label="Copy"
+                              Command="{x:Bind ViewModel.CopyCommand}"/>
+
+                <AppBarElementContainer VerticalContentAlignment="Center">
+                    <StackPanel Orientation="Horizontal" Spacing="6" Padding="4,0">
+                        <TextBlock Text="Go to:" VerticalAlignment="Center" FontSize="14"/>
+                        <TextBox x:Name="CodepointTextBox"
+                                 Width="120"
+                                 PlaceholderText="e.g. 1FA99"
+                                 Text="{x:Bind ViewModel.CodepointInput, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                 FontSize="14"
+                                 KeyDown="CodepointTextBox_KeyDown"/>
+                        <Button Content="Go"
+                                Command="{x:Bind ViewModel.NavigateToCodepointCommand}"
+                                VerticalAlignment="Center"/>
                     </StackPanel>
-                </Button>
-            </StackPanel>
+                </AppBarElementContainer>
+
+                <AppBarElementContainer VerticalContentAlignment="Center">
+                    <StackPanel Orientation="Horizontal" Spacing="6" Padding="4,0">
+                        <TextBlock Text="Sort:" VerticalAlignment="Center" FontSize="14"/>
+                        <ComboBox Width="160"
+                                  ItemsSource="{x:Bind ViewModel.SortModeOptions}"
+                                  SelectedItem="{x:Bind ViewModel.SelectedSortOption, Mode=TwoWay}"
+                                  FontSize="14"/>
+                    </StackPanel>
+                </AppBarElementContainer>
+
+                <AppBarSeparator/>
+
+                <AppBarButton Label="Install Font" Click="InstallFont_Click"
+                              ToolTipService.ToolTip="Install a .ttf or .otf font file (per-user, no admin)">
+                    <AppBarButton.Icon><SymbolIcon Symbol="Add"/></AppBarButton.Icon>
+                </AppBarButton>
+
+                <AppBarButton Label="Uninstall"
+                              Command="{x:Bind ViewModel.UninstallSelectedFontCommand}"
+                              ToolTipService.ToolTip="Uninstall the selected font">
+                    <AppBarButton.Icon><SymbolIcon Symbol="Delete"/></AppBarButton.Icon>
+                </AppBarButton>
+
+                <AppBarButton Label="Refresh"
+                              Command="{x:Bind ViewModel.RefreshCurrentFontCommand}"
+                              ToolTipService.ToolTip="Reload the selected font from disk">
+                    <AppBarButton.Icon><SymbolIcon Symbol="Refresh"/></AppBarButton.Icon>
+                </AppBarButton>
+            </CommandBar>
 
             <!-- Grouped glyph grid -->
-            <GridView Grid.Row="1"
+            <GridView Grid.Row="2"
                       x:Name="GlyphGridView"
                       ItemsSource="{x:Bind GroupedGlyphsSource.View, Mode=OneWay}"
                       SelectedItem="{x:Bind ViewModel.SelectedGlyph, Mode=TwoWay}"
@@ -154,7 +203,7 @@
             </GridView>
 
             <!-- Status bar -->
-            <Border Grid.Row="2"
+            <Border Grid.Row="3"
                     Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
                     Padding="12,6">
                 <TextBlock Text="{x:Bind ViewModel.StatusText, Mode=OneWay}"

@@ -179,6 +179,21 @@ namespace ModernCharMap.WinUI.ViewModels
         }
 
         /// <summary>
+        /// Refreshes the font service cache and reloads glyphs for the currently
+        /// selected font from disk. Useful after editing or replacing a font file.
+        /// </summary>
+        [RelayCommand]
+        private void RefreshCurrentFont()
+        {
+            if (string.IsNullOrEmpty(SelectedFontFamily)) return;
+
+            _fontService.RefreshFontList();
+            var font = SelectedFontFamily;
+            LoadGlyphsForFont(font);
+            StatusText = $"Refreshed: {font}";
+        }
+
+        /// <summary>
         /// Installs a font file via the font service and updates the status bar
         /// with the result.
         /// </summary>
@@ -265,6 +280,18 @@ namespace ModernCharMap.WinUI.ViewModels
         {
             if (_loadedGlyphs.Count > 0)
                 RebuildGlyphGroups();
+        }
+
+        /// <summary>
+        /// Sets the sort mode from a MenuBar radio item click, ensuring both
+        /// <see cref="SortMode"/> and <see cref="SelectedSortOption"/> stay in sync.
+        /// </summary>
+        /// <param name="mode">The sort mode to apply.</param>
+        public void SetSortMode(GlyphSortMode mode)
+        {
+            if (SortMode == mode) return;
+            SortMode = mode;
+            SelectedSortOption = SortModeOptions.First(o => o.Mode == mode);
         }
 
         /// <summary>
